@@ -12,20 +12,18 @@ struct TrajectoryPoint {
     double y;
 };
 
-static inline double quinticBlend(double s) {
-    double s2 = s*s;
-    double s3 = s2*s;
-    double s4 = s3*s;
-    double s5 = s4*s;
-    return 10.0*s3 - 15.0*s4 + 6.0*s5;
-}
+// Wrapper for boundary conditions
+struct TrajectoryConstraints {
+    double x;
+    double y;
+    double heading;   // in radians
+};
 
-class TrajectoryGenerator {
+class QuinticTrajectory {
 public:
-    TrajectoryGenerator(double x0, double y0, double heading0,
-                        double x1, double y1, double heading1)
-        : x0_(x0), y0_(y0), heading0_(heading0),
-          x1_(x1), y1_(y1), heading1_(heading1) {}
+    QuinticTrajectory(const TrajectoryConstraints& start,
+                      const TrajectoryConstraints& end)
+        : start_(start), end_(end) {}
 
     void addObstacle(double x, double y, double width) {
         obs_x_ = x;
@@ -35,54 +33,85 @@ public:
     }
 
     std::vector<TrajectoryPoint> generate(int num_points = 200) {
-        // Adjust y1 if obstacle present
-        double y1_adj = y1_;
-        if (has_obstacle_) {
-            // if the obstacle is between x0 and x1, adjust end y
-            if (obs_x_ > x0_ && obs_x_ < x1_) {
-                // shift up or down depending on start y position
-                if (y0_ <= obs_y_) {
-                    y1_adj = obs_y_ + obs_w_/2.0 + safety_margin_;
-                } else {
-                    y1_adj = obs_y_ - (obs_w_/2.0 + safety_margin_);
-                }
+        // Adjust target endpoint if obstacle lies between start & end
+        double y1_adj = end_.y;
+        if (has_obstacle_ && (obs_x_ > start_.x && obs_x_ < end_.x)) {
+            if (start_.y <= obs_y_) {
+                y1_adj = obs_y_ + obs_w_ / 2.0 + safety_margin_;
+            } else {
+                y1_adj = obs_y_ - (obs_w_ / 2.0 + safety_margin_);
             }
         }
 
-        std::vector<TrajectoryPoint> traj;
-        traj.reserve(num_points+1);
+        computeCoefficients(end_.x, end_.y, y1_adj);
 
-        double L = x1_ - x0_;
+        std::vector<TrajectoryPoint> traj;
+        traj.reserve(num_points + 1);
+
+        double L = end_.x - start_.x;
         for (int i = 0; i <= num_points; i++) {
-            double x = x0_ + (L * i / num_points);
-            double s = (x - x0_) / L; // [0,1]
-            double y = y0_ + (y1_adj - y0_) * quinticBlend(s);
+            double s = static_cast<double>(i) / num_points;
+            double y = evalPoly(s);
+            double x = start_.x + L * s;
             traj.push_back({x, y});
         }
         return traj;
     }
 
 private:
-    double x0_, y0_, heading0_;
-    double x1_, y1_, heading1_;
+    TrajectoryConstraints start_, end_;
+    double a0_, a1_, a2_, a3_, a4_, a5_;
     double obs_x_ = 0.0, obs_y_ = 0.0, obs_w_ = 0.0;
     bool has_obstacle_ = false;
-    const double safety_margin_ = 0.5; // extra clearance
+    const double safety_margin_ = 0.5;
+
+    void computeCoefficients(double x1, double y1_orig, double y1_adj) {
+        double L = x1 - start_.x;
+
+        // Slopes from headings
+        double yp0 = std::tan(start_.heading);
+        double yp1 = std::tan(end_.heading);
+
+        // Normalize to s = (x-x0)/L
+        double y0s = start_.y;
+        double y1s = y1_adj;
+        double yp0s = yp0 * L;
+        double yp1s = yp1 * L;
+        double ypp0s = 0.0; // assume zero curvature
+        double ypp1s = 0.0;
+
+        // Coeffs at s=0
+        a0_ = y0s;
+        a1_ = yp0s;
+        a2_ = 0.5 * ypp0s;
+
+        // Solve for a3,a4,a5 with s=1 boundary
+        double S1 = y1s - (a0_ + a1_ + a2_);
+        double S2 = yp1s - (a1_ + 2 * a2_);
+        double S3 = ypp1s - (2 * a2_);
+
+        a3_ = 10 * S1 - 4 * S2 + 0.5 * S3;
+        a4_ = -15 * S1 + 7 * S2 - S3;
+        a5_ = 6 * S1 - 3 * S2 + 0.5 * S3;
+    }
+
+    double evalPoly(double s) {
+        return a0_ + a1_ * s + a2_ * s * s + a3_ * s * s * s
+               + a4_ * s * s * s * s + a5_ * s * s * s * s * s;
+    }
 };
 
 int main() {
-    // Start and end points
-    double x0 = 0.0, y0 = 0.0, heading0 = 0.0;
-    double x1 = 20.0, y1 = 0.0, heading1 = 0.0;
+    TrajectoryConstraints start{0.0, 0.0, 0.0};     // x, y, heading (rad)
+    TrajectoryConstraints end{20.0, 0.0, 0.2};      // x, y, heading (rad)
 
-    TrajectoryGenerator gen(x0, y0, heading0, x1, y1, heading1);
+    QuinticTrajectory gen(start, end);
 
     // Insert obstacle
     gen.addObstacle(10.0, 0.0, 4.2);
 
     auto traj = gen.generate(200);
 
-    // Write to CSV
     std::ofstream file("trajectory.csv");
     file << "x,y\n";
     for (const auto& p : traj) {
