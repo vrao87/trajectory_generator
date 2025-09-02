@@ -2,116 +2,141 @@
 #include <fstream>
 #include <vector>
 #include <cmath>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+#include <limits>
 
 struct TrajectoryPoint {
     double x;
     double y;
 };
 
-// Wrapper for boundary conditions
 struct TrajectoryConstraints {
     double x;
     double y;
-    double heading;   // in radians
+    double heading;    // radians
+    double curvature;  // optional (set NAN if unused)
 };
 
-class QuinticTrajectory {
-public:
-    QuinticTrajectory(const TrajectoryConstraints& start,
-                      const TrajectoryConstraints& end)
-        : start_(start), end_(end) {}
+struct Obstacle {
+    double x;
+    double y;
+    double width;
+};
 
-    void addObstacle(double x, double y, double width) {
-        obs_x_ = x;
-        obs_y_ = y;
-        obs_w_ = width;
-        has_obstacle_ = true;
-    }
+class TrajectoryGenerator {
+public:
+    void setStart(const TrajectoryConstraints& start) { start_ = start; }
+    void setEnd(const TrajectoryConstraints& end) { end_ = end; }
+    void setObstacle(const Obstacle& obs) { obs_ = obs; has_obstacle_ = true; }
 
     std::vector<TrajectoryPoint> generate(int num_points = 200) {
-        // Adjust target endpoint if obstacle lies between start & end
-        double y1_adj = end_.y;
-        if (has_obstacle_ && (obs_x_ > start_.x && obs_x_ < end_.x)) {
-            if (start_.y <= obs_y_) {
-                y1_adj = obs_y_ + obs_w_ / 2.0 + safety_margin_;
+        double x0 = start_.x, y0 = start_.y;
+        double x1 = end_.x,   y1 = end_.y;
+
+        // Adjust target endpoint if obstacle is present
+        if (has_obstacle_ && obs_.x > x0 && obs_.x < x1) {
+            if (y0 <= obs_.y) {
+                y1 = obs_.y + obs_.width / 2.0 + safety_margin_;
             } else {
-                y1_adj = obs_y_ - (obs_w_ / 2.0 + safety_margin_);
+                y1 = obs_.y - (obs_.width / 2.0 + safety_margin_);
             }
         }
 
-        computeCoefficients(end_.x, end_.y, y1_adj);
+        double L = x1 - x0;
 
+        // Slopes (first derivative at boundaries)
+        double dy0 = std::tan(start_.heading);
+        double dy1 = std::tan(end_.heading);
+
+        // Curvatures -> convert to second derivative
+        double ddy0 = 0.0;
+        double ddy1 = 0.0;
+        if (!std::isnan(start_.curvature)) {
+            ddy0 = start_.curvature * std::pow(1 + dy0 * dy0, 1.5);
+        }
+        if (!std::isnan(end_.curvature)) {
+            ddy1 = end_.curvature * std::pow(1 + dy1 * dy1, 1.5);
+        }
+
+        // Scale derivatives into polynomial constraints
+        double p0 = y0;
+        double p1 = y1;
+        double v0 = dy0 * L;
+        double v1 = dy1 * L;
+        double a0 = ddy0 * L * L;
+        double a1 = ddy1 * L * L;
+
+        // Solve quintic polynomial coefficients
+        double c0 = p0;
+        double c1 = v0;
+        double c2 = a0 / 2.0;
+
+        double rhs1 = p1 - (c0 + c1 + c2);
+        double rhs2 = v1 - (c1 + 2 * c2);
+        double rhs3 = a1 - 2 * c2;
+
+        double A[3][3] = {
+            {1, 1, 1},
+            {3, 4, 5},
+            {6, 12, 20}
+        };
+        double B[3] = {rhs1, rhs2, rhs3};
+        double C[3];
+
+        // Gaussian elimination
+        for (int i = 0; i < 3; i++) {
+            double pivot = A[i][i];
+            for (int j = 0; j < 3; j++) A[i][j] /= pivot;
+            B[i] /= pivot;
+            for (int k = 0; k < 3; k++) {
+                if (k == i) continue;
+                double factor = A[k][i];
+                for (int j = 0; j < 3; j++) A[k][j] -= factor * A[i][j];
+                B[k] -= factor * B[i];
+            }
+        }
+        for (int i = 0; i < 3; i++) C[i] = B[i];
+
+        double c3 = C[0];
+        double c4 = C[1];
+        double c5 = C[2];
+
+        // Generate trajectory points
         std::vector<TrajectoryPoint> traj;
         traj.reserve(num_points + 1);
-
-        double L = end_.x - start_.x;
         for (int i = 0; i <= num_points; i++) {
             double s = static_cast<double>(i) / num_points;
-            double y = evalPoly(s);
-            double x = start_.x + L * s;
+            double y = c0 + c1 * s + c2 * s * s +
+                       c3 * s * s * s + c4 * s * s * s * s +
+                       c5 * s * s * s * s * s;
+            double x = x0 + s * L;
             traj.push_back({x, y});
         }
         return traj;
     }
 
 private:
-    TrajectoryConstraints start_, end_;
-    double a0_, a1_, a2_, a3_, a4_, a5_;
-    double obs_x_ = 0.0, obs_y_ = 0.0, obs_w_ = 0.0;
+    TrajectoryConstraints start_{}, end_{};
+    Obstacle obs_{};
     bool has_obstacle_ = false;
     const double safety_margin_ = 0.5;
-
-    void computeCoefficients(double x1, double y1_orig, double y1_adj) {
-        double L = x1 - start_.x;
-
-        // Slopes from headings
-        double yp0 = std::tan(start_.heading);
-        double yp1 = std::tan(end_.heading);
-
-        // Normalize to s = (x-x0)/L
-        double y0s = start_.y;
-        double y1s = y1_adj;
-        double yp0s = yp0 * L;
-        double yp1s = yp1 * L;
-        double ypp0s = 0.0; // assume zero curvature
-        double ypp1s = 0.0;
-
-        // Coeffs at s=0
-        a0_ = y0s;
-        a1_ = yp0s;
-        a2_ = 0.5 * ypp0s;
-
-        // Solve for a3,a4,a5 with s=1 boundary
-        double S1 = y1s - (a0_ + a1_ + a2_);
-        double S2 = yp1s - (a1_ + 2 * a2_);
-        double S3 = ypp1s - (2 * a2_);
-
-        a3_ = 10 * S1 - 4 * S2 + 0.5 * S3;
-        a4_ = -15 * S1 + 7 * S2 - S3;
-        a5_ = 6 * S1 - 3 * S2 + 0.5 * S3;
-    }
-
-    double evalPoly(double s) {
-        return a0_ + a1_ * s + a2_ * s * s + a3_ * s * s * s
-               + a4_ * s * s * s * s + a5_ * s * s * s * s * s;
-    }
 };
 
 int main() {
-    TrajectoryConstraints start{0.0, 0.0, 0.0};     // x, y, heading (rad)
-    TrajectoryConstraints end{20.0, 0.0, 0.2};      // x, y, heading (rad)
+    TrajectoryGenerator gen;
 
-    QuinticTrajectory gen(start, end);
+    // Start & End conditions with curvature
+    TrajectoryConstraints start{0.0, 0.0, 0.2, 0.1};       // curvature = 0
+    TrajectoryConstraints end{20.0, 0.0, 0.1, 0.0};        // curvature = 0
+    gen.setStart(start);
+    gen.setEnd(end);
 
-    // Insert obstacle
-    gen.addObstacle(10.0, 0.0, 4.2);
+    // Add obstacle
+    Obstacle obs{10.0, 0.0, 4.2};
+    gen.setObstacle(obs);
 
     auto traj = gen.generate(200);
 
+    // Save CSV
     std::ofstream file("trajectory.csv");
     file << "x,y\n";
     for (const auto& p : traj) {
